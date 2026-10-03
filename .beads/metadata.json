@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "jitsi_recorder",
+  "project_id": "b402156f-3676-476b-b3ab-995d42613759"
+}
