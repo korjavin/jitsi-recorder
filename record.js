@@ -715,6 +715,9 @@ async function main(argv) {
           ? 'audio capture ended before the call did — the recording is truncated'
           : null;
     log(`stopping: ${failureNow() ? 'failed' : reason}`);
+    // From here the stream ends because we stop it, not because capture died.
+    stream.off('end', onCaptureEnd);
+    stream.off('close', onCaptureEnd);
     await stream.stop().catch(() => {});
     const flushed = () => Promise.race([once(file, 'finish').catch(() => {}), sleep(FLUSH_MS)]);
     if (!fileError) {
