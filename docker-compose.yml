@@ -2,7 +2,7 @@ services:
   jitsi-recorder:
     # Placeholder tag. .github/workflows/deploy.yml rewrites this line with the
     # commit SHA on the `deploy` branch, which is the branch Portainer watches.
-    image: ghcr.io/korjavin/jitsi-recorder:latest
+    image: ghcr.io/korjavin/jitsi-recorder:5d58454307496b01bcd03736cb3cc2bcf3ee29c1
     container_name: jitsi-recorder
     # Every variable config.js reads, passed through by name: Compose takes the
     # values from .env next to this file, or from the stack environment when
