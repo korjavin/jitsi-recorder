@@ -9,6 +9,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { loadConfig, LEVELS } = require('./config');
 const recorder = require('./record');
+const { createEvents, sign } = require('./events');
 
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_BODY = 64 * 1024;
@@ -17,9 +18,6 @@ const OPTIONS = {
   max_duration_s: 'maxDurationS',
   empty_grace_s: 'emptyGraceS',
 };
-
-const sign = (body, secret) =>
-  `sha256=${crypto.createHmac('sha256', secret).update(body).digest('hex')}`;
 
 /** Constant-time check of x-recorder-signature over the raw body. */
 function verify(header, body, secret) {
@@ -108,8 +106,8 @@ function errorCode(err, signal) {
 function createServer({
   config,
   record = recorder.record,
-  emit = (job, event) => log('info', `${event} for job ${job.id} (delivery not wired yet)`),
   log = makeLog(config.logLevel),
+  emit, // (job, event): events.js createEvents().emit, started by the entry point
 }) {
   const dataDir = path.resolve(config.dataDir);
   const jobDir = (id) => path.join(dataDir, id);
@@ -318,5 +316,7 @@ if (require.main === module) {
     process.exit(1);
   }
   const log = makeLog(config.logLevel);
-  createServer({ config, log }).listen(config.port, () => log('info', `listening on :${config.port}`));
+  const events = createEvents({ config, log });
+  events.start();
+  createServer({ config, log, emit: events.emit }).listen(config.port, () => log('info', `listening on :${config.port}`));
 }

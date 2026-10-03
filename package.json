@@ -5,7 +5,7 @@
   "description": "Headless Jitsi recording service",
   "main": "server.js",
   "scripts": {
-    "test": "node --check record.js && node --check config.js && node --check server.js && node --test"
+    "test": "node --check record.js && node --check config.js && node --check server.js && node --check events.js && node --test"
   },
   "dependencies": {
     "puppeteer": "^24.10.0",

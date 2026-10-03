@@ -9,7 +9,7 @@ ENV PUPPETEER_SKIP_DOWNLOAD=1 \
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY config.js record.js server.js ./
+COPY config.js events.js record.js server.js ./
 
 # ponytail: runs as root — Chromium already gets --no-sandbox from the recorder;
 # a non-root user is a later polish. Run with shm_size: 1g.
