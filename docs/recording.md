@@ -38,10 +38,10 @@ Exactly one JSON line, on success only:
 All logs go to **stderr**, each line prefixed with an ISO timestamp. The room
 name is logged, never the full URL — it may carry a JWT or a password.
 
-The lines below are the **state transitions**: a caller can log these at INFO
-(everything else at DEBUG), so an operator running at INFO sees the whole call
-without turning debug logging on. Callers match them by substring, so keep the
-wording stable.
+The lines below are the **state transitions**: they are meant
+to be logged at INFO (everything else at DEBUG), so an operator running at INFO
+sees the whole call without turning debug logging on. They are matched by
+substring, so keep the wording stable.
 
 | line | when |
 |------|------|
@@ -108,9 +108,8 @@ and the stdout JSON gains a `tracks` array with absolute paths:
   the meeting timeline by adding the offset.
 * `ended_s` — when it stopped (the participant left, or the call ended).
 * `speakers.jsonl` is the fallback for the consumer when a track is missing. It
-  is not named in the stdout JSON: it lives in the directory of any
-  `tracks[].path`, which the caller service places at
-  `dirname(audio_path)/tracks`.
+  is not named in the stdout JSON: it lives in `--tracks-dir`, next to every
+  `tracks[].path`.
 * The directory is emptied at startup, the same truncate semantics `--out` has,
   so re-recording a job cannot append this call onto the previous one. For the
   same reason `--tracks-dir` is rejected when it is, or contains, the directory

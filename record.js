@@ -454,7 +454,7 @@ function applyTrackEvents(tracks, events, dir, files) {
  * was muted at the time), and which went away and why. Without these a call that
  * produced no track files gives an operator nothing to tell "the track was never
  * in features/base/tracks" from "attaching it failed". Pure so it stays testable;
- * runner.go promotes the lines it returns to INFO.
+ * the lines it returns belong at INFO.
  */
 function trackEventLines(events) {
   const lines = [];
@@ -478,10 +478,9 @@ const manifestRow = (t) => ({ id: t.id, name: t.name, offset_s: t.offset_s, ende
 
 /**
  * The single stdout line. `tracks` is omitted entirely when the feature is off,
- * which keeps the line byte-identical to the mixed-audio-only contract; so is
- * `captions` (meet.js: the speaker-hint file, only when it has lines).
+ * which keeps the line byte-identical to the mixed-audio-only contract.
  */
-function resultLine({ out, durationS, reason, participants, tracks, captions }) {
+function resultLine({ out, durationS, reason, participants, tracks }) {
   const res = {
     out,
     duration_s: Math.round(durationS * 10) / 10,
@@ -489,7 +488,6 @@ function resultLine({ out, durationS, reason, participants, tracks, captions }) 
     participants,
   };
   if (tracks) res.tracks = tracks;
-  if (captions) res.captions = captions;
   return `${JSON.stringify(res)}\n`;
 }
 
