@@ -84,7 +84,9 @@ function createEvents({ config, log, backoffMs = BACKOFF_MS, sweepMs = SWEEP_MS 
       job.events_delivered = [...new Set([...(job.events_delivered || []), event])];
       writeAtomic(jobFile, `${JSON.stringify(job, null, 2)}\n`);
     } catch (e) {
+      // Keep the outbox entry: a later sweep redelivers (receivers are idempotent).
       log('error', `job ${id}: cannot record delivery of ${event} in job.json: ${e.message}`);
+      return;
     }
     fs.rmSync(file, { force: true });
   }
@@ -124,13 +126,39 @@ function createEvents({ config, log, backoffMs = BACKOFF_MS, sweepMs = SWEEP_MS 
       });
       return;
     }
+    drain(enqueue(job, event, body), true);
+  }
+
+  function enqueue(job, event, body = JSON.stringify(payload(job, event))) {
     const file = outboxFile(job.id, event);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     writeAtomic(file, JSON.stringify({ id: job.id, event, callback_url: job.callback_url, body }));
-    drain(file, true);
+    return file;
   }
 
-  /** One attempt at every outbox file under DATA_DIR. */
+  /**
+   * A terminal job whose event is neither delivered nor in the outbox (the
+   * outbox write failed, e.g. a full disk) gets its outbox entry rebuilt.
+   */
+  function reconcile(id) {
+    let job;
+    try {
+      job = JSON.parse(fs.readFileSync(path.join(dataDir, id, 'job.json'), 'utf8'));
+    } catch {
+      return;
+    }
+    if (job.state !== 'finished' && job.state !== 'failed') return;
+    const event = `recording.${job.state}`;
+    if ((job.events_delivered || []).includes(event) || fs.existsSync(outboxFile(id, event))) return;
+    try {
+      enqueue(job, event);
+      log('info', `job ${id}: ${event} was missing from the outbox; re-queued`);
+    } catch (e) {
+      log('error', `job ${id}: cannot re-queue ${event}: ${e.message}`);
+    }
+  }
+
+  /** Reconcile every job, then one attempt at every outbox file under DATA_DIR. */
   async function sweep() {
     let ids;
     try {
@@ -140,6 +168,7 @@ function createEvents({ config, log, backoffMs = BACKOFF_MS, sweepMs = SWEEP_MS 
     }
     const files = [];
     for (const id of ids) {
+      reconcile(id);
       let names;
       try {
         names = fs.readdirSync(path.join(dataDir, id, 'outbox'));

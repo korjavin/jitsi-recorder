@@ -143,6 +143,18 @@ test('a redirect is not followed and the event stays in the outbox', async (t) =
   assert.deepEqual(stored().events_delivered, []);
 });
 
+test('sweep re-queues a terminal job whose outbox entry was never written', async (t) => {
+  const rx = await receiver(t, () => [200]);
+  const { make, outbox, stored } = setup(t, rx.url, { state: 'failed', error: 'recorder_failed' });
+  await make([]).sweep();
+  assert.equal(rx.hits.length, 1);
+  assert.equal(rx.hits[0].headers['x-recorder-event'], 'recording.failed');
+  assert.deepEqual(outbox(), []);
+  assert.deepEqual(stored().events_delivered, ['recording.failed']);
+  await make([]).sweep();
+  assert.equal(rx.hits.length, 1, 'a delivered event is not re-queued');
+});
+
 test('best-effort events: one attempt, no outbox', async (t) => {
   const rx = await receiver(t, () => [500]);
   const { job, make, outbox } = setup(t, rx.url);
