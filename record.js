@@ -572,7 +572,7 @@ async function main(argv) {
   try {
     opts = parseArgs(argv);
   } catch (e) {
-    process.stderr.write(`error: ${e.message}\n\n${USAGE}`);
+    process.stderr.write(`error: ${scrub(e.message)}\n\n${USAGE}`);
     return 2;
   }
 
@@ -581,14 +581,17 @@ async function main(argv) {
   opts.out = path.resolve(opts.out);
   fs.mkdirSync(path.dirname(opts.out), { recursive: true });
 
-  // Stop reason is also the signal latch: a second signal exits immediately.
+  // A second signal exits immediately; the first one stops gracefully even when
+  // an empty room or max duration already started the stop.
   let reason = null;
+  let signalled = false;
   const onSignal = (sig) => {
-    if (reason) {
+    if (signalled) {
       log(`${sig} again — exiting immediately`);
       process.exit(0);
     }
-    reason = 'signal';
+    signalled = true;
+    reason ||= 'signal';
     log(`${sig} received — stopping`);
   };
   process.on('SIGTERM', () => onSignal('SIGTERM'));
@@ -707,12 +710,13 @@ async function main(argv) {
     }
 
     const durationS = (Date.now() - startedAt) / 1000;
-    const failure = fileError
-      ? `output write failed: ${scrub(fileError.message)}`
-      : captureDied
-        ? 'audio capture ended before the call did — the recording is truncated'
-        : null;
-    log(`stopping: ${failure ? 'failed' : reason}`);
+    const failureNow = () =>
+      fileError
+        ? `output write failed: ${scrub(fileError.message)}`
+        : captureDied
+          ? 'audio capture ended before the call did — the recording is truncated'
+          : null;
+    log(`stopping: ${failureNow() ? 'failed' : reason}`);
     await stream.stop().catch(() => {});
     const flushed = () => Promise.race([once(file, 'finish').catch(() => {}), sleep(FLUSH_MS)]);
     if (!fileError) {
@@ -724,14 +728,17 @@ async function main(argv) {
         await flushed();
       }
     }
+    // After the mixed stream is finalized, so per-participant capture cannot
+    // stretch audio.webm past the duration_s we are about to report. Also on
+    // failure, so partial tracks keep their tracks.jsonl.
+    const trackList = trackCap ? await trackCap.finish(durationS) : null;
+
+    // Re-read: the final flush can itself hit a write error.
+    const failure = failureNow();
     if (failure) {
       log(failure);
       return 5;
     }
-
-    // After the mixed stream is finalized, so per-participant capture cannot
-    // stretch audio.webm past the duration_s we are about to report.
-    const trackList = trackCap ? await trackCap.finish(durationS) : null;
 
     const size = fs.statSync(opts.out, { throwIfNoEntry: false })?.size ?? 0;
     if (size === 0) {
