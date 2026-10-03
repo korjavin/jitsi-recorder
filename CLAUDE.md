@@ -76,15 +76,14 @@ Records a **Jitsi** room on request: joins headless (Puppeteer + Chromium, `pupp
 It is one Node process: an HTTP server and Puppeteer together (no Go wrapper,
 no subprocess protocol). **`docs/architecture.md` is the spec** — the HTTP API,
 events, artifacts, disk layout and failure handling in §3–§4 are a contract
-shared with `zulip-bot` (the orchestrator) and `meet-recorder`/`jitsi-recorder`.
-Do not change it here; the canonical copy lives in `korjavin/jitsi-capture`.
+shared with `zulip-recording-bot` (the orchestrator) and the other recorder.
+Do not change it here; the canonical copy lives in `korjavin/zulip-recording-bot`.
 
 This service knows nothing about Zulip, the transcriber or Outline. It gets a
 URL, records it, reports to the `callback_url` it was given, and echoes `meta`
 untouched.
 
-The recording code originates in `../jitsi2outline/recorder/record.js` (+ `record.test.js`, `README.md`). Copy it over and adapt it; do not
-import from the sibling repo at runtime. Docker needs `shm_size: 1g` for Chromium.
+Docker needs `shm_size: 1g` for Chromium.
 
 ## Conventions & Patterns
 
@@ -100,3 +99,6 @@ import from the sibling repo at runtime. Docker needs `shm_size: 1g` for Chromiu
   `node:test`) covers the server, HMAC and tests.
 - Recordings are never deleted by default; partial audio after a failure is
   kept and reported.
+- Docs describe this service as designed from scratch: never reference the
+  repositories or code it was derived from. Bead descriptions may name a source
+  to copy from; the README and docs must not.
