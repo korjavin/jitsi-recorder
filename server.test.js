@@ -283,3 +283,10 @@ test('SIGTERM: running jobs finish with reason signal, outbox flushed once, seco
   await shutdown('SIGINT');
   assert.deepEqual(exits, [0, 1]);
 });
+
+test('no new job starts once shutdown has begun', async (t) => {
+  const { req, calls, server } = await start(t, never);
+  await server.stopAll();
+  assert.equal((await req('POST', '/recordings', body())).status, 503);
+  assert.equal(calls.length, 0);
+});

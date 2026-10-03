@@ -152,6 +152,7 @@ function createServer({
   // Abort handles of running jobs, and their run() promises, for graceful shutdown.
   const running = new Map();
   const tasks = new Set();
+  let stopping = false; // set by stopAll: a POST still reading its body must not start a job
 
   const load = (id) => {
     try {
@@ -316,6 +317,7 @@ function createServer({
 
   /** SIGTERM: every running record() stops as finished/"signal"; resolves when all are saved. */
   async function stopAll() {
+    stopping = true;
     const pending = [...tasks];
     for (const ac of running.values()) ac.abort();
     await Promise.allSettled(pending);
@@ -353,6 +355,7 @@ function createServer({
       const bad = validate(b);
       if (bad) return send(400, { error: bad });
       if (!allowedUrl(b.url, config.jitsiBase)) return send(422, { error: 'url not allowed' });
+      if (stopping) return send(503, { error: 'shutting down' });
       const [code, job] = create(b);
       return send(code, { id: job.id, state: job.state });
     }
