@@ -232,7 +232,14 @@ function createServer({
       events_delivered: [],
     };
     fs.mkdirSync(jobDir(b.id), { recursive: true });
-    save(job);
+    try {
+      save(job);
+    } catch (e) {
+      // The directory is ours and holds no audio yet; left behind, it would
+      // make the guard above refuse every retry.
+      fs.rmSync(jobDir(b.id), { recursive: true, force: true });
+      throw e;
+    }
     log('info', `job ${job.id}: accepted for room ${recorder.roomName(job.url)}`);
     run(job).catch((e) => log('error', `job ${job.id}: ${e.message}`));
     return [202, job];
