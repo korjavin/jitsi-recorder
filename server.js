@@ -210,6 +210,8 @@ function createServer({
   function create(b) {
     const existing = load(b.id);
     if (existing) return [200, existing];
+    // Fail closed: a new job would truncate whatever audio is already there.
+    if (fs.existsSync(jobDir(b.id))) throw new Error(`job ${b.id}: directory exists without a readable job.json`);
     const options = { display_name: b.display_name ?? config.displayName };
     for (const [k, c] of Object.entries(OPTIONS)) options[k] = b[k] ?? config[c];
     const job = {

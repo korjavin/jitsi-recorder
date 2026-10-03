@@ -120,6 +120,17 @@ test('repeating an id returns 200 with the existing job and starts nothing', asy
   assert.equal(calls.length, 1);
 });
 
+test('an unreadable job.json fails closed and keeps the audio', async (t) => {
+  const { req, calls, dataDir } = await start(t, never);
+  const dir = path.join(dataDir, 'job1');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'job.json'), '{broken');
+  fs.writeFileSync(path.join(dir, 'audio.webm'), 'kept');
+  assert.equal((await req('POST', '/recordings', body())).status, 500);
+  assert.equal(calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(dir, 'audio.webm'), 'utf8'), 'kept');
+});
+
 test('GET: 404 for unknown, 200 with the job record', async (t) => {
   const { req, calls, dataDir } = await start(t, never);
   assert.equal((await req('GET', '/recordings/nope')).status, 404);
