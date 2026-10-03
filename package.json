@@ -1,0 +1,14 @@
+{
+  "name": "jitsi-recorder",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Headless Jitsi audio recorder",
+  "main": "record.js",
+  "scripts": {
+    "test": "node --check record.js && node --test"
+  },
+  "dependencies": {
+    "puppeteer": "^24.10.0",
+    "puppeteer-stream": "^3.0.8"
+  }
+}
