@@ -1,10 +1,10 @@
-#!/usr/bin/env node
 'use strict';
 
-// Headless Jitsi audio recorder: joins muted, waits (in the lobby if a human
-// moderator has to admit it), records the tab's incoming audio to WebM/Opus and
-// exits with a contract-defined code. With --tracks-dir it additionally records
-// one WebM per remote participant. See recorder/README.md.
+// Headless Jitsi audio recorder, as a library: record() joins muted, waits (in
+// the lobby if a human moderator has to admit it), records the tab's incoming
+// audio to WebM/Opus and resolves or rejects with a coded error. With tracksDir
+// it additionally records one WebM per remote participant. See
+// docs/recording.md.
 //
 // Jitsi's `window.APP` is an internal global, not a public API. Every read of it
 // lives in readJitsiState() and pollTracks() below — the two page-side
@@ -15,73 +15,34 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { once } = require('node:events');
-
-const USAGE = `usage: record.js --url <jitsi-meeting-url> --out <audio.webm>
-                 [--tracks-dir <dir>]
-                 [--join-timeout <sec, default 600>]
-                 [--max-duration <sec, default 14400>]
-                 [--empty-grace <sec, default 60>]
-                 [--display-name <str, default NoteTaker>]
-`;
+const { setTimeout: delay } = require('node:timers/promises');
 
 const DEFAULTS = {
-  url: '',
-  out: '',
-  joinTimeout: 600,
-  maxDuration: 14400,
-  emptyGrace: 60,
   displayName: 'NoteTaker',
+  joinTimeoutS: 600,
+  maxDurationS: 14400,
+  emptyGraceS: 60,
 };
-
-// --tracks-dir is deliberately absent from DEFAULTS: without the flag the key
-// stays undefined, which is both the "off" switch and what keeps the stdout
-// line byte-identical to the mixed-audio-only contract.
-const FLAGS = {
-  '--url': 'url',
-  '--out': 'out',
-  '--tracks-dir': 'tracksDir',
-  '--join-timeout': 'joinTimeout',
-  '--max-duration': 'maxDuration',
-  '--empty-grace': 'emptyGrace',
-  '--display-name': 'displayName',
-};
-
-const NUMERIC = new Set(['joinTimeout', 'maxDuration', 'emptyGrace']);
 
 const POLL_MS = 2000;
 const FLUSH_MS = 5000;
 
-/** Parse argv (without node/script). Throws on anything the contract rejects. */
-function parseArgs(argv) {
-  const opts = { ...DEFAULTS };
-  for (let i = 0; i < argv.length; i++) {
-    const flag = argv[i];
-    const key = FLAGS[flag];
-    if (!key) throw new Error(`unknown argument: ${flag}`);
-    const value = argv[++i];
-    if (value === undefined) throw new Error(`missing value for ${flag}`);
-    if (NUMERIC.has(key)) {
-      const n = Number(value);
-      if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} must be a positive number`);
-      opts[key] = n;
-    } else {
-      opts[key] = value;
-    }
+/** An error record() rejects with: `code` is not_admitted | recorder_failed. */
+const failure = (code, message, extra) => Object.assign(new Error(message), { code }, extra);
+
+/**
+ * The tracks directory is emptied on startup, so it must not be — or contain —
+ * the directory the recording itself is written to. Throws when it does.
+ */
+function checkPaths(out, tracksDir) {
+  if (!tracksDir) return;
+  const outDir = path.dirname(path.resolve(out));
+  const dir = path.resolve(tracksDir);
+  // The root directory already ends in a separator; everything else needs one.
+  const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+  if (outDir === dir || outDir.startsWith(prefix)) {
+    throw new Error('tracksDir must not contain the out directory');
   }
-  if (!opts.url) throw new Error('missing required --url');
-  if (!opts.out) throw new Error('missing required --out');
-  if (opts.tracksDir) {
-    // The tracks directory is emptied on startup, so it must not be — or
-    // contain — the directory the recording itself is written to.
-    const outDir = path.dirname(path.resolve(opts.out));
-    const tracksDir = path.resolve(opts.tracksDir);
-    // The root directory already ends in a separator; everything else needs one.
-    const prefix = tracksDir.endsWith(path.sep) ? tracksDir : tracksDir + path.sep;
-    if (outDir === tracksDir || outDir.startsWith(prefix)) {
-      throw new Error('--tracks-dir must not contain the --out directory');
-    }
-  }
-  return opts;
 }
 
 /** Jitsi config goes in the URL hash, so the bot never has to click the UI. */
@@ -362,8 +323,9 @@ function pollTracks(startedAtMs, stop) {
   return st.events.splice(0);
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (msg) => process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
+/** Resolves after `ms`, or as soon as `signal` aborts — never rejects. */
+const sleep = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {});
+const stderrLog = (msg) => process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
 
 /**
  * Error messages from puppeteer quote the URL they failed on ("net::ERR_… at
@@ -477,32 +439,17 @@ const toJsonl = (rows) => rows.map((r) => `${JSON.stringify(r)}\n`).join('');
 const manifestRow = (t) => ({ id: t.id, name: t.name, offset_s: t.offset_s, ended_s: t.ended_s });
 
 /**
- * The single stdout line. `tracks` is omitted entirely when the feature is off,
- * which keeps the line byte-identical to the mixed-audio-only contract.
- */
-function resultLine({ out, durationS, reason, participants, tracks }) {
-  const res = {
-    out,
-    duration_s: Math.round(durationS * 10) / 10,
-    reason,
-    participants,
-  };
-  if (tracks) res.tracks = tracks;
-  return `${JSON.stringify(res)}\n`;
-}
-
-/**
  * Wires per-participant capture onto an already-recording page, or returns null
- * when --tracks-dir was not given. Failures here are logged and downgrade to
+ * when no tracksDir was given. Failures here are logged and downgrade to
  * null: losing per-speaker tracks must never cost us the mixed recording.
  */
-async function setupTracks(page, tracksDir, startedAt) {
+async function setupTracks(page, tracksDir, startedAt, log = stderrLog) {
   if (!tracksDir) return null;
   const dir = path.resolve(tracksDir);
   const tracks = new Map();
   const files = new Map(); // attach key -> file, so chunks and manifest agree
   try {
-    // Truncate semantics, like --out: a re-recorded job reuses its directory,
+    // Truncate semantics, like `out`: a re-recorded job reuses its directory,
     // and appending onto the previous run's files would glue two calls together.
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
@@ -543,7 +490,16 @@ async function setupTracks(page, tracksDir, startedAt) {
     /** `endS` is the duration reported for the mixed file; see the clamp below. */
     async finish(endS) {
       await pump(true);
-      const list = [...tracks.values()];
+      // A track whose file never got a byte (the page reloaded before the first
+      // chunk, the write failed) is not a track: reporting it would hand the
+      // consumer a path to nothing.
+      const list = [...tracks.values()].filter((t) => {
+        try {
+          return (fs.statSync(t.path, { throwIfNoEntry: false })?.size ?? 0) > 0;
+        } catch {
+          return false;
+        }
+      });
       // The mixed file stops first and its duration is frozen before the flush,
       // while these timestamps are wall-clock: without the clamp a track would
       // claim to run past the recording it belongs to.
@@ -565,80 +521,110 @@ async function setupTracks(page, tracksDir, startedAt) {
   };
 }
 
-async function main(argv) {
-  let opts;
+/**
+ * Record one Jitsi room into `out` (and per-participant files into `tracksDir`
+ * when given). Everything — browser, page, files — belongs to this call, so
+ * several recordings can run in one process.
+ *
+ * Resolves with {durationS, reason, participants, tracks} (`tracks` is null
+ * without `tracksDir`); `reason` is empty_room | max_duration | signal.
+ * Rejects with an Error whose `code` is:
+ *   not_admitted    — never joined within joinTimeoutS, or aborted before joining
+ *   recorder_failed — bad options, browser/page failure, write error, capture
+ *                     died mid-call, or an empty file. When this happens after
+ *                     joining, the error also carries {durationS, participants,
+ *                     tracks} for whatever partial audio reached the disk.
+ *
+ * onState('waiting_in_lobby') fires on entering the lobby, onState('joined')
+ * once audio is being written. Aborting `signal` stops gracefully with reason
+ * "signal". `deps` replaces puppeteer-stream in tests.
+ */
+async function record(opts, deps = {}) {
+  const o = { ...opts };
+  for (const [k, v] of Object.entries(DEFAULTS)) o[k] ??= v;
+  const log = o.log || stderrLog;
+  const emit = (state) => {
+    try {
+      o.onState?.(state);
+    } catch (e) {
+      log(`onState(${state}) threw: ${scrub(e.message)}`);
+    }
+  };
   try {
-    opts = parseArgs(argv);
+    if (!o.url) throw new Error('missing url');
+    if (!o.out) throw new Error('missing out');
+    // A NaN limit would silently disable its stop rule.
+    for (const k of ['joinTimeoutS', 'maxDurationS', 'emptyGraceS']) {
+      if (!(Number.isFinite(o[k]) && o[k] > 0)) throw new Error(`${k} must be a positive number`);
+    }
+    checkPaths(o.out, o.tracksDir);
+    // Absolute from here on, so `out` and `tracks[].path` have the same shape
+    // whatever the caller passed.
+    o.out = path.resolve(o.out);
+    fs.mkdirSync(path.dirname(o.out), { recursive: true });
   } catch (e) {
-    process.stderr.write(`error: ${scrub(e.message)}\n\n${USAGE}`);
-    return 2;
+    throw failure('recorder_failed', scrub(e.message));
   }
 
-  // Absolute from here on, so the reported `out` and `tracks[].path` have the
-  // same shape whatever the caller passed.
-  opts.out = path.resolve(opts.out);
-  fs.mkdirSync(path.dirname(opts.out), { recursive: true });
-
-  // A second signal exits immediately; the first one stops gracefully even when
-  // an empty room or max duration already started the stop.
+  // The first stop reason wins, but an abort always stops even when an empty
+  // room or max duration already started the stop.
   let reason = null;
-  let signalled = false;
-  const onSignal = (sig) => {
-    if (signalled) {
-      log(`${sig} again — exiting immediately`);
-      process.exit(0);
-    }
-    signalled = true;
+  const onAbort = () => {
     reason ||= 'signal';
-    log(`${sig} received — stopping`);
+    log('abort received — stopping');
   };
-  process.on('SIGTERM', () => onSignal('SIGTERM'));
-  process.on('SIGINT', () => onSignal('SIGINT'));
+  if (o.signal?.aborted) onAbort();
+  else o.signal?.addEventListener('abort', onAbort, { once: true });
 
-  const { launch, getStream } = require('puppeteer-stream');
+  const { launch, getStream } = deps.launch ? deps : require('puppeteer-stream');
   let browser;
   let page;
+  // Set when Chromium or the tab dies: from then on nothing will ever join or
+  // record, so waiting out a timeout would only delay the failure.
+  let dead = null;
   try {
-    // puppeteer-stream only honours headless when the value is literally 'new'
-    // (it needs the capture extension, which legacy headless cannot load).
-    // Passing the puppeteer module lets it find the bundled browser when
-    // PUPPETEER_EXECUTABLE_PATH is unset.
-    browser = await launch(require('puppeteer'), {
-      headless: 'new',
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'],
-      // Puppeteer's own handlers would kill Chromium (and exit 130 on SIGINT)
-      // before we finalize the file. Shutdown is onSignal's job.
-      handleSIGINT: false,
-      handleSIGTERM: false,
-      handleSIGHUP: false,
-    });
-    page = await browser.newPage();
-    log(`joining room ${roomName(opts.url)} as ${opts.displayName}`);
-    await page.goto(buildUrl(opts.url, opts.displayName), {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
-    });
-  } catch (e) {
-    log(`browser launch/page failure: ${scrub(e.message)}`);
-    if (browser) await browser.close().catch(() => {});
-    return 4;
-  }
+    try {
+      // puppeteer-stream only honours headless when the value is literally
+      // 'new' (it needs the capture extension, which legacy headless cannot
+      // load). Passing the puppeteer module lets it find the bundled browser
+      // when PUPPETEER_EXECUTABLE_PATH is unset.
+      browser = await launch(deps.launch ? null : require('puppeteer'), {
+        headless: 'new',
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required'],
+        // Puppeteer's own handlers would kill Chromium on a process signal
+        // before we finalize the file. Shutdown is the caller's, via `signal`.
+        handleSIGINT: false,
+        handleSIGTERM: false,
+        handleSIGHUP: false,
+      });
+      browser.once('disconnected', () => (dead ||= 'browser disconnected'));
+      page = await browser.newPage();
+      page.once('error', () => (dead ||= 'page crashed'));
+      log(`joining room ${roomName(o.url)} as ${o.displayName}`);
+      await page.goto(buildUrl(o.url, o.displayName), {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+    } catch (e) {
+      throw failure('recorder_failed', `browser launch/page failure: ${scrub(e.message)}`);
+    }
 
-  try {
     // --- join phase -------------------------------------------------------
     // Anything that is not "joined" counts as waiting, including a moderator
-    // wall we cannot tell apart from a lobby; --join-timeout is the backstop.
+    // wall we cannot tell apart from a lobby; joinTimeoutS is the backstop.
     // ponytail: no explicit rejected/kicked detection — Jitsi signals it only
-    // through a transient notification. Add one if exit 3 proves too slow.
-    const joinDeadline = Date.now() + opts.joinTimeout * 1000;
+    // through a transient notification. Add one if not_admitted proves too slow.
+    const joinDeadline = Date.now() + o.joinTimeoutS * 1000;
     let joined = false;
+    let joinedWith = [];
     let lastPhase = '';
     while (!reason && Date.now() < joinDeadline) {
       let state;
       try {
         state = await page.evaluate(readJitsiState);
       } catch (e) {
+        if (dead) throw failure('recorder_failed', `${dead} while joining`);
         log(`state probe failed: ${scrub(e.message)}`);
         state = { joined: false, knocking: false, membersCount: 0 };
       }
@@ -646,46 +632,66 @@ async function main(argv) {
       if (phase !== lastPhase) {
         log(`state: ${phase}`);
         lastPhase = phase;
+        if (phase === 'waiting_in_lobby') emit(phase);
       }
       if (state.joined) {
         joined = true;
+        joinedWith = state.participants || [];
         log(`conference mode: ${state.p2p == null ? 'unknown' : state.p2p ? 'p2p' : 'jvb'}`);
         break;
       }
-      await sleep(POLL_MS);
+      if (dead) throw failure('recorder_failed', `${dead} while joining`);
+      await sleep(POLL_MS, o.signal);
     }
     if (!joined) {
-      log(reason === 'signal' ? 'stopped before joining' : 'join timeout');
-      return 3;
+      throw failure('not_admitted', reason === 'signal' ? 'stopped before joining' : 'join timeout');
     }
 
     // --- record phase -----------------------------------------------------
-    const stream = await getStream(page, { audio: true, video: false });
-    const file = fs.createWriteStream(opts.out);
-    // An unhandled 'error' here (cannot open, disk full) would crash the process
-    // with exit 1, skipping cleanup and the contract's exit codes.
-    let fileError = null;
-    file.on('error', (e) => {
-      fileError = e;
-    });
+    let stream;
+    try {
+      stream = await getStream(page, { audio: true, video: false });
+    } catch (e) {
+      throw failure('recorder_failed', `audio capture failed to start: ${scrub(e.message)}`);
+    }
     // The capture stream only ends on its own if the extension's MediaRecorder
     // died — we end it deliberately after the loop, so an end during the loop
-    // means the rest of the call was never recorded.
+    // (or while `out` opens) means the rest of the call was never recorded.
     let captureDied = false;
     const onCaptureEnd = () => {
       captureDied = true;
     };
     stream.once('end', onCaptureEnd);
     stream.once('close', onCaptureEnd);
+    const file = fs.createWriteStream(o.out);
+    // An unhandled 'error' here (cannot open, disk full) would crash the whole
+    // process, every other recording included.
+    let fileError = null;
+    file.on('error', (e) => {
+      fileError = e;
+    });
+    try {
+      // 'joined' promises audio is being written: not before `out` is open.
+      await once(file, 'open');
+    } catch (e) {
+      await stream.stop().catch(() => {});
+      throw failure('recorder_failed', `cannot open output: ${scrub(e.message)}`);
+    }
+    // Each chunk is appended as it arrives (architecture §3.6): a crash keeps
+    // everything recorded up to that moment.
     stream.pipe(file);
     const startedAt = Date.now();
-    log(`recording -> ${opts.out}`);
-    const trackCap = await setupTracks(page, opts.tracksDir, startedAt);
+    log(`recording -> ${o.out}`);
+    emit('joined');
+    const trackCap = await setupTracks(page, o.tracksDir, startedAt, log);
 
     let aloneSince = null;
-    const participants = new Set(); // insertion order == first-seen order
-    while (!reason && !fileError && !captureDied) {
-      await sleep(POLL_MS);
+    // Insertion order == first-seen order; seeded from the join probe so an
+    // abort during the first poll keeps who was already there.
+    const participants = new Set(joinedWith);
+    while (!reason && !fileError && !captureDied && !dead) {
+      await sleep(POLL_MS, o.signal);
+      if (reason) break;
       let membersCount = 0; // page gone == nobody left to record
       try {
         const state = await page.evaluate(readJitsiState);
@@ -699,12 +705,12 @@ async function main(argv) {
         membersCount,
         aloneSince,
         now: Date.now(),
-        emptyGrace: opts.emptyGrace,
+        emptyGrace: o.emptyGraceS,
         startedAt,
-        maxDuration: opts.maxDuration,
+        maxDuration: o.maxDurationS,
       });
       aloneSince = next.aloneSince;
-      if (next.reason) reason = next.reason;
+      if (next.reason) reason ||= next.reason;
     }
 
     const durationS = (Date.now() - startedAt) / 1000;
@@ -713,7 +719,9 @@ async function main(argv) {
         ? `output write failed: ${scrub(fileError.message)}`
         : captureDied
           ? 'audio capture ended before the call did — the recording is truncated'
-          : null;
+          : dead
+            ? `${dead} mid-call — the recording is truncated`
+            : null;
     log(`stopping: ${failureNow() ? 'failed' : reason}`);
     // From here the stream ends because we stop it, not because capture died.
     stream.off('end', onCaptureEnd);
@@ -730,51 +738,33 @@ async function main(argv) {
       }
     }
     // After the mixed stream is finalized, so per-participant capture cannot
-    // stretch audio.webm past the duration_s we are about to report. Also on
+    // stretch audio.webm past the durationS we are about to report. Also on
     // failure, so partial tracks keep their tracks.jsonl.
-    const trackList = trackCap ? await trackCap.finish(durationS) : null;
+    const tracks = trackCap ? await trackCap.finish(durationS) : null;
+    const result = { durationS, reason, participants: [...participants], tracks };
 
     // Re-read: the final flush can itself hit a write error.
-    const failure = failureNow();
-    if (failure) {
-      log(failure);
-      return 5;
-    }
+    const failed = failureNow();
+    if (failed) throw failure('recorder_failed', failed, result);
 
-    const size = fs.statSync(opts.out, { throwIfNoEntry: false })?.size ?? 0;
-    if (size === 0) {
-      log(`output missing or empty: ${opts.out}`);
-      return 5;
-    }
+    const size = fs.statSync(o.out, { throwIfNoEntry: false })?.size ?? 0;
+    if (size === 0) throw failure('recorder_failed', 'output missing or empty', result);
     log(`wrote ${size} bytes in ${durationS.toFixed(1)}s, ${participants.size} participant(s)`);
-    process.stdout.write(
-      resultLine({
-        out: opts.out,
-        durationS,
-        reason,
-        participants: [...participants],
-        tracks: trackList,
-      })
-    );
-    return 0;
+    return result;
+  } catch (e) {
+    const ours = e.code === 'not_admitted' || e.code === 'recorder_failed';
+    const err = ours ? e : failure('recorder_failed', scrub(e.message));
+    log(`${err.code}: ${err.message}`);
+    throw err;
   } finally {
-    await browser.close().catch(() => {});
+    o.signal?.removeEventListener('abort', onAbort);
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
-if (require.main === module) {
-  main(process.argv.slice(2)).then(
-    (code) => process.exit(code),
-    (e) => {
-      log(`fatal: ${e && e.stack ? e.stack : e}`);
-      process.exit(4);
-    }
-  );
-}
-
 module.exports = {
-  USAGE,
-  parseArgs,
+  record,
+  checkPaths,
   buildUrl,
   roomName,
   shouldStop,
@@ -789,5 +779,4 @@ module.exports = {
   trackEventLines,
   toJsonl,
   manifestRow,
-  resultLine,
 };
