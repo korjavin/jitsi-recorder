@@ -3,49 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-// Requiring must not launch a browser or run the CLI.
-const { USAGE, parseArgs, buildUrl, roomName, shouldStop } = require('./record.js');
-
-const MIN = ['--url', 'https://jitsi.example.com/room-abc', '--out', '/tmp/a.webm'];
-
-test('usage names the required flags', () => {
-  assert.match(USAGE, /--url/);
-  assert.match(USAGE, /--out/);
-});
-
-test('parseArgs applies the contract defaults', () => {
-  assert.deepStrictEqual(parseArgs(MIN), {
-    url: 'https://jitsi.example.com/room-abc',
-    out: '/tmp/a.webm',
-    joinTimeout: 600,
-    maxDuration: 14400,
-    emptyGrace: 60,
-    displayName: 'NoteTaker',
-  });
-});
-
-test('parseArgs overrides every flag', () => {
-  const opts = parseArgs([
-    ...MIN,
-    '--join-timeout', '30',
-    '--max-duration', '120',
-    '--empty-grace', '5',
-    '--display-name', 'Someone Else',
-  ]);
-  assert.strictEqual(opts.joinTimeout, 30);
-  assert.strictEqual(opts.maxDuration, 120);
-  assert.strictEqual(opts.emptyGrace, 5);
-  assert.strictEqual(opts.displayName, 'Someone Else');
-});
-
-test('parseArgs rejects bad input', () => {
-  assert.throws(() => parseArgs(['--out', '/tmp/a.webm']), /--url/);
-  assert.throws(() => parseArgs(['--url', 'https://jitsi.example.com/r']), /--out/);
-  assert.throws(() => parseArgs([...MIN, '--nope', '1']), /unknown argument/);
-  assert.throws(() => parseArgs([...MIN, '--join-timeout']), /missing value/);
-  assert.throws(() => parseArgs([...MIN, '--empty-grace', 'soon']), /positive number/);
-  assert.throws(() => parseArgs([...MIN, '--max-duration', '0']), /positive number/);
-});
+// Requiring must not launch a browser.
+const { buildUrl, roomName, shouldStop, checkPaths } = require('./record.js');
 
 test('buildUrl puts the join config in the hash and replaces any existing one', () => {
   const url = buildUrl('https://jitsi.example.com/room-abc#stale=1', 'NoteTaker');
@@ -103,7 +62,7 @@ test('shouldStop prefers max_duration over empty_room when both fire', () => {
   assert.strictEqual(both.reason, 'max_duration');
 });
 
-// --- per-participant tracks (--tracks-dir) ----------------------------------
+// --- per-participant tracks (tracksDir) -------------------------------------
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -115,33 +74,20 @@ const {
   trackEventLines,
   toJsonl,
   manifestRow,
-  resultLine,
   setupTracks,
 } = require('./record.js');
 
-test('parseArgs leaves tracksDir unset without the flag, and takes it with', () => {
-  assert.ok(!('tracksDir' in parseArgs(MIN)), 'the key must be absent, not empty');
-  assert.strictEqual(parseArgs([...MIN, '--tracks-dir', '/tmp/tr']).tracksDir, '/tmp/tr');
-  assert.throws(() => parseArgs([...MIN, '--tracks-dir']), /missing value/);
-});
-
-test('parseArgs rejects a tracks dir that holds the recording', () => {
+test('checkPaths rejects a tracks dir that holds the recording', () => {
   // setupTracks empties the directory, so these would delete the open audio
   // file (and everything else the job keeps next to it).
-  const out = ['--url', 'https://jitsi.example.com/r', '--out', '/data/jobs/7/audio.webm'];
-  assert.throws(() => parseArgs([...out, '--tracks-dir', '/data/jobs/7']), /must not contain/);
-  assert.throws(() => parseArgs([...out, '--tracks-dir', '/data/jobs/7/']), /must not contain/);
-  assert.throws(() => parseArgs([...out, '--tracks-dir', '/data']), /must not contain/);
-  assert.throws(() => parseArgs([...out, '--tracks-dir', '/']), /must not contain/);
-  // The real layout — a subdirectory of the job — stays allowed.
-  assert.strictEqual(
-    parseArgs([...out, '--tracks-dir', '/data/jobs/7/tracks']).tracksDir,
-    '/data/jobs/7/tracks'
-  );
-});
-
-test('usage documents --tracks-dir', () => {
-  assert.match(USAGE, /--tracks-dir/);
+  const out = '/data/jobs/7/audio.webm';
+  assert.throws(() => checkPaths(out, '/data/jobs/7'), /must not contain/);
+  assert.throws(() => checkPaths(out, '/data/jobs/7/'), /must not contain/);
+  assert.throws(() => checkPaths(out, '/data'), /must not contain/);
+  assert.throws(() => checkPaths(out, '/'), /must not contain/);
+  // The real layout — a subdirectory of the job — stays allowed, as does none.
+  checkPaths(out, '/data/jobs/7/tracks');
+  checkPaths(out, undefined);
 });
 
 test('trackFile keeps a participant id to one path segment', () => {
@@ -262,49 +208,24 @@ test('toJsonl writes one parseable object per line, nothing for an empty list', 
   assert.strictEqual(toJsonl([]), '');
 });
 
-test('resultLine omits tracks entirely without --tracks-dir', () => {
-  const base = {
-    out: '/d/audio.webm',
-    durationS: 114.14,
-    reason: 'empty_room',
-    participants: ['A'],
-  };
-  assert.strictEqual(
-    resultLine({ ...base, tracks: null }),
-    '{"out":"/d/audio.webm","duration_s":114.1,"reason":"empty_room","participants":["A"]}\n'
-  );
-});
-
-test('resultLine appends the tracks array with --tracks-dir', () => {
-  const track = { id: 'p1', name: 'First', path: '/d/tracks/p1.webm', offset_s: 1, ended_s: 2 };
-  const parsed = JSON.parse(
-    resultLine({
-      out: '/d/audio.webm',
-      durationS: 10,
-      reason: 'signal',
-      participants: ['First'],
-      tracks: [track],
-    })
-  );
-  assert.deepStrictEqual(parsed.tracks, [track]);
-  assert.strictEqual(Object.keys(parsed).at(-1), 'tracks');
-});
-
-test('resultLine still emits an empty tracks array when nobody was recorded', () => {
-  const parsed = JSON.parse(
-    resultLine({ out: '/d/a.webm', durationS: 1, reason: 'signal', participants: [], tracks: [] })
-  );
-  assert.deepStrictEqual(parsed.tracks, []);
-});
-
 // setupTracks against a fake page: no browser, no network. `evaluate` stands in
-// for pollTracks and replays queued event batches.
-const fakePage = (batches) => ({
-  exposeFunction: async () => {},
-  evaluate: async () => batches.shift() ?? [],
-});
+// for pollTracks and replays queued event batches; every 'start' also sends one
+// chunk through the exposed writer, as the page's MediaRecorder would.
+const fakePage = (batches) => {
+  let write = null;
+  return {
+    exposeFunction: async (name, fn) => {
+      write = fn;
+    },
+    evaluate: async () => {
+      const events = batches.shift() ?? [];
+      for (const e of events) if (e.type === 'start') write(e.key, 'AAAA');
+      return events;
+    },
+  };
+};
 
-test('setupTracks stays out of the way without --tracks-dir', async () => {
+test('setupTracks stays out of the way without a tracks dir', async () => {
   assert.strictEqual(await setupTracks(fakePage([]), '', Date.now()), null);
   assert.strictEqual(await setupTracks(fakePage([]), undefined, Date.now()), null);
 });
@@ -329,7 +250,8 @@ test('setupTracks writes the manifests and clears a previous run', async () => {
     Date.now()
   );
   assert.ok(cap, 'setupTracks returned null');
-  assert.ok(!fs.existsSync(path.join(dir, 'p1.webm')), 'stale track file survived');
+  // The fake page already wrote this run's first chunk (base64 'AAAA').
+  assert.deepStrictEqual(fs.readFileSync(path.join(dir, 'p1.webm')), Buffer.alloc(3));
 
   await cap.pump(false);
   // p1 ended on its own; p2 never did, so it ran to the end of the recording.
@@ -447,4 +369,131 @@ test('applyTrackEvents ignores the count events that only reach the log', () => 
   );
   assert.deepStrictEqual(speakers, []);
   assert.strictEqual(tracks.size, 0);
+});
+
+test('finish drops a track whose file never got a byte', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tracks-'));
+  // p2 starts with no chunk behind it (the page reloaded before the first one).
+  const page = fakePage([
+    [{ type: 'start', id: 'p1', key: 'p1#a', name: 'First', t: 1 }],
+  ]);
+  const cap = await setupTracks(page, dir, Date.now());
+  const evaluate = page.evaluate;
+  page.evaluate = async () => [{ type: 'start', id: 'p2', key: 'p2#a', t: 5 }];
+  await cap.pump(false);
+  page.evaluate = evaluate;
+  assert.deepStrictEqual((await cap.finish(10)).map((t) => t.id), ['p1']);
+  assert.strictEqual(
+    fs.readFileSync(path.join(dir, 'tracks.jsonl'), 'utf8'),
+    '{"id":"p1","name":"First","offset_s":1,"ended_s":10}\n'
+  );
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- record() against a stubbed browser -------------------------------------
+
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
+const { record } = require('./record.js');
+
+/** `states` is replayed by readJitsiState probes; the last one repeats. */
+function fakeBrowser(states, { onProbe } = {}) {
+  const browser = new EventEmitter();
+  const page = new EventEmitter();
+  const capture = new PassThrough();
+  capture.stop = async () => capture.end();
+  page.goto = async () => {};
+  page.exposeFunction = async () => {};
+  page.evaluate = async () => {
+    onProbe?.(browser);
+    if (!browser.connected) throw new Error('Target closed');
+    return states.length > 1 ? states.shift() : states[0];
+  };
+  browser.connected = true;
+  browser.newPage = async () => page;
+  browser.close = async () => {
+    browser.closed = true;
+  };
+  const deps = { launch: async () => browser, getStream: async () => capture };
+  return { browser, capture, deps };
+}
+
+const JOINED = { joined: true, knocking: false, membersCount: 2, p2p: false, participants: ['Alice'] };
+const LOBBY = { joined: false, knocking: true, membersCount: 0, participants: [] };
+const quiet = () => {};
+
+test('record writes audio as it arrives and stops gracefully on abort', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rec-'));
+  const out = path.join(dir, 'audio.webm');
+  const { browser, capture, deps } = fakeBrowser([LOBBY, JOINED]);
+  const ac = new AbortController();
+  const states = [];
+  let midCall = null;
+  const onState = (s) => {
+    states.push(s);
+    if (s !== 'joined') return;
+    capture.write('chunk-1');
+    // §3.6: the chunk is on disk while the call is still running (the write
+    // stream opens the file asynchronously, so give it a moment).
+    const check = (tries) => {
+      midCall = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
+      if (midCall || !tries) ac.abort();
+      else setTimeout(check, 20, tries - 1);
+    };
+    setTimeout(check, 20, 50);
+  };
+  const res = await record(
+    { url: 'https://jitsi.example.com/SomeRoom', out, signal: ac.signal, log: quiet, onState },
+    deps
+  );
+  assert.strictEqual(midCall, 'chunk-1');
+  assert.deepStrictEqual(states, ['waiting_in_lobby', 'joined']);
+  assert.strictEqual(res.reason, 'signal');
+  assert.strictEqual(res.tracks, null);
+  assert.strictEqual(fs.readFileSync(out, 'utf8'), 'chunk-1');
+  assert.ok(browser.closed, 'the browser belongs to the call and is closed by it');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('record rejects not_admitted when aborted before joining', async () => {
+  const { browser, deps } = fakeBrowser([LOBBY]);
+  const out = path.join(os.tmpdir(), 'never.webm');
+  const signal = AbortSignal.abort();
+  await assert.rejects(record({ url: 'https://jitsi.example.com/r', out, signal, log: quiet }, deps), {
+    code: 'not_admitted',
+  });
+  assert.ok(browser.closed);
+});
+
+test('record rejects not_admitted after the join timeout', async () => {
+  const { deps } = fakeBrowser([LOBBY]);
+  const out = path.join(os.tmpdir(), 'never.webm');
+  await assert.rejects(
+    record({ url: 'https://jitsi.example.com/r', out, joinTimeoutS: 0.01, log: quiet }, deps),
+    { code: 'not_admitted' }
+  );
+});
+
+test('record fails fast when Chromium dies in the lobby', async () => {
+  let probes = 0;
+  const onProbe = (browser) => {
+    if (++probes === 2) {
+      browser.connected = false;
+      browser.emit('disconnected');
+    }
+  };
+  const { deps } = fakeBrowser([LOBBY], { onProbe });
+  const out = path.join(os.tmpdir(), 'never.webm');
+  const t0 = Date.now();
+  await assert.rejects(
+    record({ url: 'https://jitsi.example.com/r', out, joinTimeoutS: 600, log: quiet }, deps),
+    { code: 'recorder_failed' }
+  );
+  assert.ok(Date.now() - t0 < 10_000, 'must not wait out the join timeout');
+});
+
+test('record rejects a tracks dir that holds the recording before launching', async () => {
+  const deps = { launch: async () => assert.fail('must not launch'), getStream: null };
+  const opts = { url: 'https://jitsi.example.com/r', out: '/data/7/a.webm', tracksDir: '/data/7' };
+  await assert.rejects(record({ ...opts, log: quiet }, deps), { code: 'recorder_failed' });
 });

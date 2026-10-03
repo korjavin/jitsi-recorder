@@ -2,46 +2,58 @@
 
 `record.js` drives a headless Chromium into a Jitsi room as a muted, camera-off
 participant, records the tab's incoming (mixed) audio and writes a single
-WebM/Opus file. Today it is a CLI (below); it becomes the library the HTTP service calls in a later
-change — see `docs/architecture.md` for the service contract.
+WebM/Opus file. It is a library: the HTTP service (see `docs/architecture.md`)
+calls `record()` in-process, one call per job, and several calls may run at
+once — every browser, page and file handle belongs to its call.
 
-## Usage
+## API
 
-```bash
-node record.js --url <https://jitsi.example.com/ROOM> --out <path/audio.webm> \
-  [--tracks-dir <dir>] \
-  [--join-timeout <sec, default 600>] \
-  [--max-duration <sec, default 14400>] \
-  [--empty-grace <sec, default 60>] \
-  [--display-name <str, default NoteTaker>]
+```js
+const { record } = require('./record.js');
+
+const res = await record({
+  url: 'https://jitsi.example.com/SomeRoom', // required
+  out: '/data/123/audio.webm',               // required; parent dir is created
+  tracksDir: '/data/123/tracks',             // optional, see below
+  displayName: 'NoteTaker',                  // default
+  joinTimeoutS: 600,                         // default
+  maxDurationS: 14400,                       // default
+  emptyGraceS: 60,                           // default
+  signal,                                    // AbortSignal: stop gracefully
+  onState: (s) => {},                        // 'waiting_in_lobby' | 'joined'
+  log: (line) => {},                         // default: stderr with ISO timestamp
+});
+// res = {durationS, reason, participants, tracks}
 ```
 
-The parent directory of `--out` is created if missing, as is `--tracks-dir`.
-
-### stdout
-
-Exactly one JSON line, on success only:
-
-```json
-{"out":"/data/audio.webm","duration_s":114.1,"reason":"empty_room","participants":["Alice","Bob"]}
-```
-
-* `out` — absolute, whatever shape `--out` was given in, so it matches the
-  absolute `tracks[].path` below.
-* `reason` — `empty_room` | `signal` | `max_duration`
+* `reason` — `empty_room` | `signal` | `max_duration`.
 * `participants` — display names of non-bot participants seen at any point
   during the recording, deduped, first-seen order. Hidden participants
   (transcriber/SIP ghosts) and nameless ones are omitted.
-* `tracks` — present **only** with `--tracks-dir` (see below). Without the flag
-  the line is byte-identical to the one above.
+* `tracks` — `null` without `tracksDir`, else the array described below.
 
-All logs go to **stderr**, each line prefixed with an ISO timestamp. The room
-name is logged, never the full URL — it may carry a JWT or a password.
+### Errors
 
-The lines below are the **state transitions**: they are meant
-to be logged at INFO (everything else at DEBUG), so an operator running at INFO
-sees the whole call without turning debug logging on. They are matched by
-substring, so keep the wording stable.
+`record()` rejects with an `Error` whose `code` is:
+
+| code | meaning |
+|------|---------|
+| `not_admitted` | never got into the conference within `joinTimeoutS` (incl. never admitted from the lobby), or aborted before joining |
+| `recorder_failed` | bad options, browser launch / page failure, Chromium dying (also while in the lobby), a write error, the audio capture dying mid-call (truncated file), or an empty output file |
+
+A `recorder_failed` raised after joining also carries `durationS`,
+`participants` and `tracks` for whatever partial audio reached the disk; the
+files are kept.
+
+### State and logs
+
+`onState('waiting_in_lobby')` fires when the bot enters a lobby,
+`onState('joined')` once it is admitted and audio is being written to `out`.
+A callback that throws is logged and ignored.
+
+Every other milestone goes through `log`. The room name is logged, never the
+full URL — it may carry a JWT or a password. The lines below are the **state
+transitions**, meant to be logged at INFO (everything else at DEBUG):
 
 | line | when |
 |------|------|
@@ -53,25 +65,15 @@ substring, so keep the wording stable.
 | `track detached <id> reason=<left\|stopping>` | that recorder was stopped |
 | `stopping: <reason>` | the mixed recording is being finalized |
 | `wrote <bytes> bytes in <s>s, <n> participant(s)` | the file is on disk |
+| `<code>: <message>` | the call is rejecting |
 
 `remote audio tracks` versus `track attached` is what separates "Jitsi never
 offered the track" from "attaching it failed" when a call ends with no tracks.
 
-### Exit codes
+### Stopping on request
 
-| code | meaning |
-|------|---------|
-| 0 | recorded OK; file exists and is non-empty |
-| 2 | bad arguments (usage on stderr) |
-| 3 | never got into the conference within `--join-timeout` (incl. never admitted from the lobby), or stopped by a signal before joining |
-| 4 | browser launch / page failure |
-| 5 | the recording did not complete: output file missing/empty, a write error, or the audio capture died mid-call (truncated file) |
-
-### Signals
-
-`SIGTERM` / `SIGINT` stop gracefully: the recording is finalized, the JSON line
-is printed with `"reason":"signal"` and the process exits 0. A second signal
-exits immediately.
+Aborting `signal` stops gracefully: the recording is finalized and `record()`
+resolves with `reason: "signal"`. Process signals are the caller's business.
 
 ## Output format
 
@@ -79,16 +81,15 @@ WebM/Opus (48 kHz stereo) exactly as Chrome's `MediaRecorder` produces it — no
 ffmpeg, no WAV conversion — the downstream transcriber decodes WebM/Opus itself.
 `ffprobe` reports `Duration: N/A` on these files (a live MediaRecorder stream
 has no seek cues); that is normal and decoders still read every frame. Use the
-`duration_s` field from the JSON line.
+`durationS` from the result.
 
-`--out` is the **mixed** conference stream, one track for everybody.
+`out` is the **mixed** conference stream, one track for everybody.
 
-## Per-participant tracks (`--tracks-dir`)
+## Per-participant tracks (`tracksDir`)
 
-Purely additive: without the flag nothing below happens and the mixed-only
-behaviour — including the stdout line, byte for byte — is unchanged.
+Purely additive: without it nothing below happens and `tracks` is `null`.
 
-With `--tracks-dir <dir>` the recorder also writes, next to the mixed file:
+With `tracksDir: <dir>` the recorder also writes, next to the mixed file:
 
 | file | contents |
 |------|----------|
@@ -96,11 +97,10 @@ With `--tracks-dir <dir>` the recorder also writes, next to the mixed file:
 | `<dir>/tracks.jsonl` | one line per track: `{"id","name","offset_s","ended_s"}` |
 | `<dir>/speakers.jsonl` | dominant-speaker timeline, one line per change: `{"t_s","id","name"}` |
 
-and the stdout JSON gains a `tracks` array with absolute paths:
+and the result's `tracks` lists them with absolute paths:
 
 ```json
-{"out":"/data/audio.webm","duration_s":114.1,"reason":"empty_room","participants":["Alice","Bob"],
- "tracks":[{"id":"a1b2c3d4","name":"Alice","path":"/data/tracks/a1b2c3d4.webm","offset_s":2.104,"ended_s":113.8}]}
+[{"id":"a1b2c3d4","name":"Alice","path":"/data/tracks/a1b2c3d4.webm","offset_s":2.104,"ended_s":113.8}]
 ```
 
 * `offset_s` — seconds between the start of the mixed recording and the moment
@@ -108,12 +108,13 @@ and the stdout JSON gains a `tracks` array with absolute paths:
   the meeting timeline by adding the offset.
 * `ended_s` — when it stopped (the participant left, or the call ended).
 * `speakers.jsonl` is the fallback for the consumer when a track is missing. It
-  is not named in the stdout JSON: it lives in `--tracks-dir`, next to every
-  `tracks[].path`.
-* The directory is emptied at startup, the same truncate semantics `--out` has,
+  is not in the result: it lives in `tracksDir`, next to every `tracks[].path`.
+* A track whose file never received a byte (the page reloaded before its first
+  chunk, or the write failed) is left out of `tracks` and `tracks.jsonl`.
+* The directory is emptied at startup, the same truncate semantics `out` has,
   so re-recording a job cannot append this call onto the previous one. For the
-  same reason `--tracks-dir` is rejected when it is, or contains, the directory
-  `--out` writes to.
+  same reason `tracksDir` is rejected when it is, or contains, the directory
+  `out` writes to.
 * One participant can appear on more than one line: if Jitsi reloads the page
   mid-call the recorders restart, and each attach gets its own file and its own
   `offset_s` rather than a second WebM document appended to the first.
@@ -135,8 +136,8 @@ previous file.
 Stopping is a handshake rather than a wait: the final poll stops every recorder,
 waits for each `onstop` (which fires after that recorder's last chunk) and then
 for every outstanding chunk to be acknowledged by Node, so `tracks.jsonl` and
-the stdout line are written over complete files. Both stages are bounded inside
-the page, so a stuck recorder cannot hold up the exit.
+the result are written over complete files. Both stages are bounded inside
+the page, so a stuck recorder cannot hold up the stop.
 
 A track only ends when its owner leaves the room. If the track itself
 disappears — a mute, a P2P/bridge switch, a renegotiation — the MediaRecorder
@@ -174,7 +175,7 @@ Known limits:
 **new** headless mode — the code passes `headless: 'new'` literally, which is
 the only value the library honours (anything else, `true` included, silently
 launches headed). If a future Chromium drops extension support in headless
-mode, the fallback is `xvfb-run -a node record.js …` with `headless: false`;
+mode, the fallback is running the service under `xvfb-run -a` with `headless: false`;
 that needs `xvfb` in the image, so prefer keeping new-headless working.
 
 ## Joining, lobbies and the meet.jit.si moderator wall
@@ -193,8 +194,8 @@ Jitsi on **2026-09-13**:
 * `APP.conference.membersCount` → participant count **including** the bot
 * `APP.conference.listMembers()` → remote participants only, `getDisplayName()`
 
-Anything that is not "joined" counts as waiting until `--join-timeout` expires,
-then exit 3. That deliberately covers the public **meet.jit.si** case: an
+Anything that is not "joined" counts as waiting until `joinTimeoutS` expires,
+then `not_admitted`. That deliberately covers the public **meet.jit.si** case: an
 unauthenticated client creating a fresh room is put in the lobby with
 `knocking: true`, `membersOnly: true` and the message *"The conference has not
 yet started because no moderators have yet arrived"* — indistinguishable from a
@@ -206,12 +207,15 @@ transient notification, so a rejection falls through to the same timeout.
 
 The record phase polls every 2 s and stops on the first of:
 
-* `membersCount <= 1` (only the bot left) continuously for `--empty-grace`
+* `membersCount <= 1` (only the bot left) continuously for `emptyGraceS`
   seconds — note that Jitsi's count can lag ~30–60 s when a participant's
   browser dies instead of leaving cleanly, so the real stop can come later than
   the grace period alone suggests;
-* `--max-duration` reached;
-* `SIGTERM` / `SIGINT`.
+* `maxDurationS` reached;
+* `signal` aborted.
+
+Audio is appended to `out` chunk by chunk as the capture extension delivers it
+(architecture §3.6), so a crash keeps everything recorded up to that moment.
 
 The decision itself is the pure, unit-tested `shouldStop()`.
 
@@ -222,7 +226,9 @@ PUPPETEER_SKIP_DOWNLOAD=1 npm ci
 npm test        # node --check record.js && node --test
 ```
 
-`parseArgs`, `buildUrl`, `roomName`, `shouldStop` and the per-track pure
-helpers (`trackFile`, `applyTrackEvents`, `toJsonl`, `manifestRow`,
-`resultLine`) are exported and covered. No browser is launched and no network is
-touched; the browser paths are verified manually against a throwaway room.
+`buildUrl`, `roomName`, `shouldStop`, `checkPaths` and the per-track pure
+helpers (`trackFile`, `trackPath`, `applyTrackEvents`, `toJsonl`,
+`manifestRow`) are exported and covered, and `record()` itself runs against a
+stubbed browser (its second argument replaces puppeteer-stream). No browser is
+launched and no network is touched; the real browser path is verified manually
+against a throwaway room.
