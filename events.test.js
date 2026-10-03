@@ -155,6 +155,19 @@ test('sweep re-queues a terminal job whose outbox entry was never written', asyn
   assert.equal(rx.hits.length, 1, 'a delivered event is not re-queued');
 });
 
+test('flush: cuts the backoff short and gives the outbox entry one more attempt', async (t) => {
+  // 500 first, then 204; the 60 s backoff would outlive the test without flush.
+  const rx = await receiver(t, (hit, n) => [n === 1 ? 500 : 204]);
+  const { job, make, outbox, stored } = setup(t, rx.url);
+  const ev = make([60e3]);
+  ev.emit(job, 'recording.finished');
+  await until(() => rx.hits.length === 1);
+  await ev.flush();
+  assert.equal(rx.hits.length, 2);
+  assert.deepEqual(outbox(), []);
+  assert.deepEqual(stored().events_delivered, ['recording.finished']);
+});
+
 test('best-effort events: one attempt, no outbox', async (t) => {
   const rx = await receiver(t, () => [500]);
   const { job, make, outbox } = setup(t, rx.url);
