@@ -6,3 +6,4 @@
 .beads/proxieddb/
 *.gate.lock*
 node_modules/
+.env

@@ -1,0 +1,82 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build & Push Container Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+  update-deploy-branch:
+    name: Update Deploy Branch & Trigger Portainer
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Job-level, not step-level: a step's own `env:` is not yet in the `env`
+    # context when GitHub evaluates that step's `if`, so the webhook guard below
+    # would always see an empty string and never fire. The `secrets` context is
+    # not allowed in a step `if` at all, hence this hop.
+    env:
+      PORTAINER_WEBHOOK: ${{ secrets.PORTAINER_REDEPLOY_HOOK }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Switch to deploy branch
+        run: git checkout -B deploy
+
+      - name: Update docker-compose.yml with SHA tag
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_COMMIT_SHA: ${{ github.sha }}
+        run: |
+          IMAGE_NAME="ghcr.io/${GITHUB_REPO}"
+          sed -i -E "s|image: ghcr.io/[^:]+:.*|image: ${IMAGE_NAME}:${GITHUB_COMMIT_SHA}|g" docker-compose.yml
+
+      - name: Commit and push changes
+        env:
+          GITHUB_COMMIT_SHA: ${{ github.sha }}
+        run: |
+          git add docker-compose.yml
+          git commit -m "Deploy commit ${GITHUB_COMMIT_SHA} [skip ci]" || echo "No changes to commit"
+          git push origin deploy --force
+
+      - name: Trigger Portainer Redeploy Webhook
+        if: ${{ env.PORTAINER_WEBHOOK != '' }}
+        uses: distributhor/workflow-webhook@2381f0e9c7b6bf061fb1405bd0804b8706116369 # v3.0.8
+        with:
+          webhook_url: ${{ secrets.PORTAINER_REDEPLOY_HOOK }}
