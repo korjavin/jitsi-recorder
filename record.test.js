@@ -450,6 +450,8 @@ test('record writes audio as it arrives and stops gracefully on abort', async ()
   assert.deepStrictEqual(states, ['waiting_in_lobby', 'joined']);
   assert.strictEqual(res.reason, 'signal');
   assert.strictEqual(res.tracks, null);
+  // Aborted during the first poll: who was there at join time still counts.
+  assert.deepStrictEqual(res.participants, ['Alice']);
   assert.strictEqual(fs.readFileSync(out, 'utf8'), 'chunk-1');
   assert.ok(browser.closed, 'the browser belongs to the call and is closed by it');
   fs.rmSync(dir, { recursive: true, force: true });

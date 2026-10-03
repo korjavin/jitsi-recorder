@@ -617,6 +617,7 @@ async function record(opts, deps = {}) {
     // through a transient notification. Add one if not_admitted proves too slow.
     const joinDeadline = Date.now() + o.joinTimeoutS * 1000;
     let joined = false;
+    let joinedWith = [];
     let lastPhase = '';
     while (!reason && Date.now() < joinDeadline) {
       let state;
@@ -635,6 +636,7 @@ async function record(opts, deps = {}) {
       }
       if (state.joined) {
         joined = true;
+        joinedWith = state.participants || [];
         log(`conference mode: ${state.p2p == null ? 'unknown' : state.p2p ? 'p2p' : 'jvb'}`);
         break;
       }
@@ -652,6 +654,15 @@ async function record(opts, deps = {}) {
     } catch (e) {
       throw failure('recorder_failed', `audio capture failed to start: ${scrub(e.message)}`);
     }
+    // The capture stream only ends on its own if the extension's MediaRecorder
+    // died — we end it deliberately after the loop, so an end during the loop
+    // (or while `out` opens) means the rest of the call was never recorded.
+    let captureDied = false;
+    const onCaptureEnd = () => {
+      captureDied = true;
+    };
+    stream.once('end', onCaptureEnd);
+    stream.once('close', onCaptureEnd);
     const file = fs.createWriteStream(o.out);
     // An unhandled 'error' here (cannot open, disk full) would crash the whole
     // process, every other recording included.
@@ -666,15 +677,6 @@ async function record(opts, deps = {}) {
       await stream.stop().catch(() => {});
       throw failure('recorder_failed', `cannot open output: ${scrub(e.message)}`);
     }
-    // The capture stream only ends on its own if the extension's MediaRecorder
-    // died — we end it deliberately after the loop, so an end during the loop
-    // means the rest of the call was never recorded.
-    let captureDied = false;
-    const onCaptureEnd = () => {
-      captureDied = true;
-    };
-    stream.once('end', onCaptureEnd);
-    stream.once('close', onCaptureEnd);
     // Each chunk is appended as it arrives (architecture §3.6): a crash keeps
     // everything recorded up to that moment.
     stream.pipe(file);
@@ -684,7 +686,9 @@ async function record(opts, deps = {}) {
     const trackCap = await setupTracks(page, o.tracksDir, startedAt, log);
 
     let aloneSince = null;
-    const participants = new Set(); // insertion order == first-seen order
+    // Insertion order == first-seen order; seeded from the join probe so an
+    // abort during the first poll keeps who was already there.
+    const participants = new Set(joinedWith);
     while (!reason && !fileError && !captureDied && !dead) {
       await sleep(POLL_MS, o.signal);
       if (reason) break;
