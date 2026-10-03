@@ -11,7 +11,7 @@ const path = require('node:path');
 const { setTimeout: sleep } = require('node:timers/promises');
 
 const GUARANTEED = new Set(['recording.finished', 'recording.failed']);
-// ponytail: fixed table, same as jitsi2outline/webhook.go; the sweep covers the rest.
+// ponytail: fixed table; the hourly sweep covers the rest.
 const BACKOFF_MS = [5e3, 15e3, 45e3, 120e3, 300e3];
 const SWEEP_MS = 3600e3;
 const TIMEOUT_MS = 30e3;
@@ -49,8 +49,9 @@ function writeAtomic(file, data) {
 function createEvents({ config, log, backoffMs = BACKOFF_MS, sweepMs = SWEEP_MS }) {
   const dataDir = path.resolve(config.dataDir);
   const outboxFile = (id, event) => path.join(dataDir, id, 'outbox', `${event}.json`);
-  // Outbox files with a delivery loop running, so the sweep does not double up.
-  const busy = new Set();
+  // Outbox file -> its running delivery loop, so the sweep joins it instead of
+  // doubling up, and flush() can wait for it.
+  const busy = new Map();
   const ac = new AbortController();
   let timer = null;
 
@@ -92,9 +93,12 @@ function createEvents({ config, log, backoffMs = BACKOFF_MS, sweepMs = SWEEP_MS 
   }
 
   /** Deliver one outbox file; with retry, walk the backoff table first. */
-  async function drain(file, retry) {
-    if (busy.has(file)) return;
-    busy.add(file);
+  function drain(file, retry) {
+    if (!busy.has(file)) busy.set(file, deliver(file, retry).finally(() => busy.delete(file)));
+    return busy.get(file);
+  }
+
+  async function deliver(file, retry) {
     try {
       const { id, event, callback_url: url, body } = JSON.parse(fs.readFileSync(file, 'utf8'));
       for (let i = 0; ; i++) {
@@ -112,8 +116,6 @@ function createEvents({ config, log, backoffMs = BACKOFF_MS, sweepMs = SWEEP_MS 
       }
     } catch (e) {
       if (e.name !== 'AbortError') log('error', `outbox ${path.relative(dataDir, file)}: ${e.message}`);
-    } finally {
-      busy.delete(file);
     }
   }
 
@@ -192,7 +194,18 @@ function createEvents({ config, log, backoffMs = BACKOFF_MS, sweepMs = SWEEP_MS 
     ac.abort();
   }
 
-  return { emit, sweep, start, stop };
+  /**
+   * Shutdown: stop retrying, let attempts already on the wire finish, then one
+   * more attempt at every outbox file. Whatever is still undelivered stays in
+   * the outbox for the startup sweep.
+   */
+  async function flush() {
+    stop();
+    await Promise.allSettled(busy.values());
+    await sweep();
+  }
+
+  return { emit, sweep, start, stop, flush };
 }
 
 module.exports = { createEvents, payload, sign };

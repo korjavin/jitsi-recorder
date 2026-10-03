@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { once } = require('node:events');
 const { loadConfig } = require('./config');
-const { createServer, sign, errorCode } = require('./server');
+const { createServer, makeShutdown, sign, errorCode } = require('./server');
 
 const SECRET = 'test-secret';
 
@@ -39,7 +39,7 @@ async function start(t, record) {
     if (sig !== null) headers['x-recorder-signature'] = sig ?? sign(raw, SECRET);
     return fetch(base + p, { method, headers, body: method === 'GET' ? undefined : raw });
   };
-  return { req, calls, events, dataDir };
+  return { req, calls, events, dataDir, server };
 }
 
 const body = (over = {}) => ({
@@ -199,4 +199,87 @@ test('not_admitted: join timeout stays, abort before joining is interrupted', ()
   assert.equal(errorCode(err, new AbortController().signal), 'not_admitted');
   assert.equal(errorCode(err, AbortSignal.abort()), 'interrupted');
   assert.equal(errorCode(new Error('boom'), AbortSignal.abort()), 'recorder_failed');
+});
+
+test('startup: a leftover recording job becomes failed/interrupted with its partial files', async (t) => {
+  const { req, events, dataDir, server } = await start(t, never);
+  const mk = (id, state) => {
+    const dir = path.join(dataDir, id);
+    fs.mkdirSync(path.join(dir, 'tracks'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ ...body({ id }), state, artifacts: [] }));
+    return dir;
+  };
+  const dir = mk('job1', 'recording');
+  fs.writeFileSync(path.join(dir, 'audio.webm'), 'partial');
+  fs.writeFileSync(path.join(dir, 'tracks', 'p1.webm'), 'x');
+  fs.writeFileSync(path.join(dir, 'tracks', 'p1_2.webm'), 'y');
+  fs.writeFileSync(path.join(dir, 'tracks', 'empty.webm'), '');
+  fs.writeFileSync(path.join(dir, 'tracks', 'speakers.jsonl'), '{}\n');
+  mk('job2', 'joining'); // never joined: interrupted, no audio, so no artifacts
+  mk('job3', 'finished');
+  server.recover();
+  const job = await (await req('GET', '/recordings/job1')).json();
+  assert.equal(job.state, 'failed');
+  assert.equal(job.error, 'interrupted');
+  assert.deepEqual(
+    job.artifacts.map((a) => [a.kind, path.basename(a.path), a.participant_id]),
+    [
+      ['audio', 'audio.webm', undefined],
+      ['track', 'p1.webm', 'p1'],
+      ['track', 'p1_2.webm', 'p1'],
+      ['speakers', 'speakers.jsonl', undefined],
+    ],
+  );
+  const job2 = await (await req('GET', '/recordings/job2')).json();
+  assert.equal(job2.error, 'interrupted');
+  assert.deepEqual(job2.artifacts, []);
+  assert.equal((await (await req('GET', '/recordings/job3')).json()).state, 'finished');
+  assert.deepEqual(events, ['recording.failed', 'recording.failed']);
+  assert.equal(fs.readFileSync(path.join(dir, 'audio.webm'), 'utf8'), 'partial');
+});
+
+test('a crash mid-call without a manifest still reports the track files on disk', async (t) => {
+  const { req, events } = await start(t, async (o) => {
+    o.onState('joined');
+    fs.writeFileSync(o.out, 'partial');
+    fs.mkdirSync(o.tracksDir, { recursive: true });
+    fs.writeFileSync(path.join(o.tracksDir, 'p1.webm'), 'x');
+    throw new Error('Target closed');
+  });
+  await req('POST', '/recordings', body());
+  const job = await waitState(req, 'job1', 'failed');
+  assert.equal(job.error, 'recorder_failed');
+  assert.deepEqual(job.artifacts.map((a) => a.kind), ['audio', 'track']);
+  assert.equal(job.artifacts[1].participant_id, 'p1');
+  assert.deepEqual(events, ['recording.started', 'recording.failed']);
+});
+
+test('SIGTERM: running jobs finish with reason signal, outbox flushed once, second signal exits at once', async (t) => {
+  const { req, events, dataDir, server } = await start(t, (o) => {
+    o.onState('joined');
+    fs.writeFileSync(o.out, 'audio');
+    return new Promise((resolve) => {
+      o.signal.addEventListener('abort', () => resolve({ durationS: 2, reason: 'signal', participants: [], tracks: [] }));
+    });
+  });
+  await req('POST', '/recordings', body());
+  await waitState(req, 'job1', 'recording');
+  const exits = [];
+  let flushed = 0;
+  const shutdown = makeShutdown({
+    server,
+    events: { flush: async () => flushed++ },
+    log: () => {},
+    exit: (c) => exits.push(c),
+  });
+  await shutdown('SIGTERM');
+  const job = JSON.parse(fs.readFileSync(path.join(dataDir, 'job1', 'job.json'), 'utf8'));
+  assert.equal(job.state, 'finished');
+  assert.equal(job.reason, 'signal');
+  assert.deepEqual(events, ['recording.started', 'recording.finished']);
+  assert.equal(flushed, 1);
+  assert.deepEqual(exits, [0]);
+  assert.equal(server.running.size, 0);
+  await shutdown('SIGINT');
+  assert.deepEqual(exits, [0, 1]);
 });

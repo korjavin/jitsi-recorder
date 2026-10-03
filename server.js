@@ -64,13 +64,50 @@ function validate(b) {
   return null;
 }
 
-const fileSize = (p) => {
+const stat = (p) => {
   try {
-    return fs.statSync(p, { throwIfNoEntry: false })?.size ?? 0;
+    return fs.statSync(p, { throwIfNoEntry: false }) ?? null;
   } catch {
-    return 0;
+    return null;
   }
 };
+const fileSize = (p) => stat(p)?.size ?? 0;
+const round3 = (n) => Math.round(n * 1000) / 1000;
+
+/**
+ * Track files on disk, for a job record() never returned a manifest for (a
+ * crash, a restart). A chunked WebM is playable as written. The participant id
+ * is the file name (`<id>.webm`, `<id>_2.webm` after a page reload); the name
+ * is unknown.
+ * ponytail: offset_s/ended_s are estimated from file birth/mtime against
+ * audio.webm's birth (first chunk lands ~1 s after attach); null where the
+ * filesystem has no birth time. A per-poll manifest in record.js would be exact.
+ */
+function scanTracks(dir) {
+  const tdir = path.join(dir, 'tracks');
+  let names;
+  try {
+    names = fs.readdirSync(tdir).filter((n) => n.endsWith('.webm')).sort();
+  } catch {
+    return [];
+  }
+  const t0 = stat(path.join(dir, 'audio.webm'))?.birthtimeMs || 0;
+  const rel = (ms) => (t0 && ms ? round3(Math.max(0, (ms - t0) / 1000)) : null);
+  const list = [];
+  for (const n of names) {
+    const p = path.join(tdir, n);
+    const st = stat(p);
+    if (!st?.size) continue;
+    list.push({
+      id: n.replace(/(_\d+)?\.webm$/, ''),
+      name: '',
+      path: p,
+      offset_s: rel(st.birthtimeMs),
+      ended_s: rel(st.mtimeMs),
+    });
+  }
+  return list;
+}
 
 /** §3.5 artifacts: one audio, then tracks and speakers — none without audio. */
 function artifacts(dir, tracks) {
@@ -112,8 +149,9 @@ function createServer({
   const dataDir = path.resolve(config.dataDir);
   const jobDir = (id) => path.join(dataDir, id);
   const jobFile = (id) => path.join(jobDir(id), 'job.json');
-  // Abort handles of running jobs, for graceful shutdown.
+  // Abort handles of running jobs, and their run() promises, for graceful shutdown.
   const running = new Map();
+  const tasks = new Set();
 
   const load = (id) => {
     try {
@@ -194,8 +232,10 @@ function createServer({
         ended_at: new Date().toISOString(),
         duration_s: e.durationS ?? null,
         participants: e.participants ?? job.participants,
-        // Partial audio is kept and reported, never deleted.
-        artifacts: artifacts(dir, e.tracks),
+        // Partial audio is kept and reported, never deleted. No manifest (the
+        // page or browser died before record() could write one) -> list the
+        // track files on disk.
+        artifacts: artifacts(dir, e.tracks ?? scanTracks(dir)),
       });
       trySave(job);
       log('error', `job ${job.id}: failed in room ${room}: ${job.error}`);
@@ -239,8 +279,46 @@ function createServer({
       throw e;
     }
     log('info', `job ${job.id}: accepted for room ${recorder.roomName(job.url)}`);
-    run(job).catch((e) => log('error', `job ${job.id}: ${e.message}`));
+    const task = run(job).catch((e) => log('error', `job ${job.id}: ${e.message}`));
+    tasks.add(task);
+    task.finally(() => tasks.delete(task));
     return [202, job];
+  }
+
+  /**
+   * Startup (§4): a job still joining/recording on disk belonged to a process
+   * that died. It becomes failed/interrupted with whatever audio and track
+   * files it left, and recording.failed goes to its stored callback_url.
+   */
+  function recover() {
+    let ids;
+    try {
+      ids = fs.readdirSync(dataDir);
+    } catch {
+      return;
+    }
+    for (const id of ids) {
+      if (!ID_RE.test(id) || running.has(id)) continue;
+      const job = load(id);
+      if (job?.state !== 'joining' && job?.state !== 'recording') continue;
+      Object.assign(job, {
+        state: 'failed',
+        error: 'interrupted',
+        error_message: 'the recorder restarted during the job',
+        ended_at: new Date().toISOString(),
+        artifacts: artifacts(jobDir(id), scanTracks(jobDir(id))),
+      });
+      trySave(job);
+      log('error', `job ${id}: interrupted in room ${recorder.roomName(job.url)}`);
+      fire(job, 'recording.failed');
+    }
+  }
+
+  /** SIGTERM: every running record() stops as finished/"signal"; resolves when all are saved. */
+  async function stopAll() {
+    const pending = [...tasks];
+    for (const ac of running.values()) ac.abort();
+    await Promise.allSettled(pending);
   }
 
   async function handle(req, res) {
@@ -294,7 +372,7 @@ function createServer({
       res.end('{"error":"internal"}');
     });
   });
-  server.running = running;
+  Object.assign(server, { running, recover, stopAll });
   return server;
 }
 
@@ -305,7 +383,31 @@ function makeLog(level = 'info') {
   };
 }
 
-module.exports = { createServer, sign, verify, allowedUrl, validate, artifacts, errorCode };
+/**
+ * SIGTERM/SIGINT handler: stop taking requests, stop every recording
+ * gracefully, flush the outbox once, exit. A second signal exits at once.
+ */
+function makeShutdown({ server, events, log, exit = process.exit }) {
+  let stopping = false;
+  return async (sig) => {
+    if (stopping) {
+      log('error', `${sig} again: exiting now`);
+      return exit(1);
+    }
+    stopping = true;
+    log('info', `${sig}: stopping ${server.running.size} recording(s)`);
+    server.close();
+    try {
+      await server.stopAll();
+      await events.flush();
+    } catch (e) {
+      log('error', `shutdown: ${e.message}`);
+    }
+    exit(0);
+  };
+}
+
+module.exports = { createServer, makeShutdown, sign, verify, allowedUrl, validate, artifacts, scanTracks, errorCode };
 
 if (require.main === module) {
   let config;
@@ -317,6 +419,10 @@ if (require.main === module) {
   }
   const log = makeLog(config.logLevel);
   const events = createEvents({ config, log });
+  const server = createServer({ config, log, emit: events.emit });
+  server.recover();
   events.start();
-  createServer({ config, log, emit: events.emit }).listen(config.port, () => log('info', `listening on :${config.port}`));
+  server.listen(config.port, () => log('info', `listening on :${config.port}`));
+  const shutdown = makeShutdown({ server, events, log });
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, shutdown);
 }
