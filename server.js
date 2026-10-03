@@ -107,7 +107,7 @@ function createServer({
   config,
   record = recorder.record,
   log = makeLog(config.logLevel),
-  emit = createEvents({ config, log }).emit,
+  emit, // (job, event): events.js createEvents().emit, started by the entry point
 }) {
   const dataDir = path.resolve(config.dataDir);
   const jobDir = (id) => path.join(dataDir, id);
