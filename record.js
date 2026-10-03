@@ -493,9 +493,13 @@ async function setupTracks(page, tracksDir, startedAt, log = stderrLog) {
       // A track whose file never got a byte (the page reloaded before the first
       // chunk, the write failed) is not a track: reporting it would hand the
       // consumer a path to nothing.
-      const list = [...tracks.values()].filter(
-        (t) => (fs.statSync(t.path, { throwIfNoEntry: false })?.size ?? 0) > 0
-      );
+      const list = [...tracks.values()].filter((t) => {
+        try {
+          return (fs.statSync(t.path, { throwIfNoEntry: false })?.size ?? 0) > 0;
+        } catch {
+          return false;
+        }
+      });
       // The mixed file stops first and its duration is frozen before the flush,
       // while these timestamps are wall-clock: without the clamp a track would
       // claim to run past the recording it belongs to.
@@ -536,7 +540,8 @@ async function setupTracks(page, tracksDir, startedAt, log = stderrLog) {
  * "signal". `deps` replaces puppeteer-stream in tests.
  */
 async function record(opts, deps = {}) {
-  const o = { ...DEFAULTS, ...opts };
+  const o = { ...opts };
+  for (const [k, v] of Object.entries(DEFAULTS)) o[k] ??= v;
   const log = o.log || stderrLog;
   const emit = (state) => {
     try {
@@ -548,6 +553,10 @@ async function record(opts, deps = {}) {
   try {
     if (!o.url) throw new Error('missing url');
     if (!o.out) throw new Error('missing out');
+    // A NaN limit would silently disable its stop rule.
+    for (const k of ['joinTimeoutS', 'maxDurationS', 'emptyGraceS']) {
+      if (!(Number.isFinite(o[k]) && o[k] > 0)) throw new Error(`${k} must be a positive number`);
+    }
     checkPaths(o.out, o.tracksDir);
     // Absolute from here on, so `out` and `tracks[].path` have the same shape
     // whatever the caller passed.
@@ -650,6 +659,13 @@ async function record(opts, deps = {}) {
     file.on('error', (e) => {
       fileError = e;
     });
+    try {
+      // 'joined' promises audio is being written: not before `out` is open.
+      await once(file, 'open');
+    } catch (e) {
+      await stream.stop().catch(() => {});
+      throw failure('recorder_failed', `cannot open output: ${scrub(e.message)}`);
+    }
     // The capture stream only ends on its own if the extension's MediaRecorder
     // died — we end it deliberately after the loop, so an end during the loop
     // means the rest of the call was never recorded.

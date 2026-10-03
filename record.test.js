@@ -496,4 +496,19 @@ test('record rejects a tracks dir that holds the recording before launching', as
   const deps = { launch: async () => assert.fail('must not launch'), getStream: null };
   const opts = { url: 'https://jitsi.example.com/r', out: '/data/7/a.webm', tracksDir: '/data/7' };
   await assert.rejects(record({ ...opts, log: quiet }, deps), { code: 'recorder_failed' });
+  // A NaN limit would silently disable its stop rule.
+  const nan = { url: 'https://jitsi.example.com/r', out: '/tmp/a.webm', maxDurationS: NaN };
+  await assert.rejects(record({ ...nan, log: quiet }, deps), /maxDurationS/);
+});
+
+test('record does not announce joined when the output cannot be opened', async () => {
+  const { deps } = fakeBrowser([JOINED]);
+  const states = [];
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'rec-')); // a directory
+  await assert.rejects(
+    record({ url: 'https://jitsi.example.com/r', out, log: quiet, onState: (s) => states.push(s) }, deps),
+    { code: 'recorder_failed' }
+  );
+  assert.deepStrictEqual(states, []);
+  fs.rmSync(out, { recursive: true, force: true });
 });
