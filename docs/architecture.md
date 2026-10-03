@@ -9,20 +9,23 @@
 Calls are recorded on request from chat and turned into transcripts. Each
 concern is its own service with its own repository, image and Compose stack:
 
-* a **bot** talks to people and orchestrates the work;
+* **orchestrators** take requests and run the work end to end — a Zulip bot
+  (people ask in chat) and a Google Calendar bot (people invite it to a
+  meeting);
 * a **recorder** per meeting platform joins a call and writes its audio;
 * the **transcriber** and **tr2outline** turn audio into a published transcript.
 
 A recorder can be replaced, added (another platform) or redeployed without
-touching the others, and another front-end (Telegram, a calendar) can drive the
-same recorders later.
+touching the others, and any number of orchestrators can drive the same
+recorders.
 
 ## 2. Services
 
 ```text
                      POST /recordings {id, url, callback_url, meta}
  zulip-recording-bot ────────────────────────────┬──> jitsi-recorder
- (orchestrator)                                  └──> meet-recorder
+ gcalendar-recording-bot ────────────────────────┴──> meet-recorder
+ (orchestrators, independent of each other)
      ^   │                                                  │
      │   │       events (recording.*) -> callback_url       │
      │   └<─────────────────────────────────────────────────┘
@@ -35,6 +38,7 @@ same recorders later.
 | service | repo | owns |
 |---|---|---|
 | zulip-recording-bot | `korjavin/zulip-recording-bot` | Zulip events, reactions and DMs; picks a recorder by URL; job bookkeeping; recording-length policy; watchdog; hands finished recordings to the transcriber; `POST /notify` |
+| gcalendar-recording-bot | `korjavin/gcalendar-recording-bot` | web page to connect a Google Calendar; records every meeting in a connected calendar that has a Meet/Jitsi link and the bot's invite address among its attendees; e-mails the person who connected the calendar; its own job bookkeeping, watchdog and transcriber hand-off |
 | jitsi-recorder | `korjavin/jitsi-recorder` | joining a Jitsi room headless and writing its audio (mixed + per-participant tracks) |
 | meet-recorder | `korjavin/meet-recorder` | joining a Google Meet call as a guest and writing its audio (WAV) + caption speaker hints |
 | transcriber | `korjavin/transcriber` | CPU transcription of a finished recording |
@@ -45,8 +49,13 @@ Rules:
 * A recorder knows nothing about Zulip, the transcriber or Outline. It gets a
   URL, records it, and reports to the `callback_url` it was given. Anything it
   does not understand travels in `meta`, untouched.
-* The bot is the only orchestrator. Routing (who hears about a finished
-  recording) lives in the bot only, never in a recorder's config.
+* Orchestrators are independent of each other: each runs its jobs end to end
+  (recorder events, watchdog, transcriber hand-off, `/notify`). Routing (who
+  hears about a finished recording) lives in the orchestrator, never in a
+  recorder's config. They share no code; duplication is accepted on purpose.
+* Job ids are unique across orchestrators, because recorders and the
+  transcriber key directories by them: the Zulip bot uses the Zulip message id,
+  the calendar bot `cal-<hash>`.
 * The recorders share no code and no image. They implement the same contract
   (§3); duplication between them is accepted on purpose.
 
@@ -213,13 +222,14 @@ and tells the user.
 **Delivery.** Both directions retry with a persisted outbox, so a peer being
 redeployed costs a delay, never an event.
 
-## 5. Bot ↔ transcriber
+## 5. Orchestrator ↔ transcriber
 
 The transcriber's inbound interface is fixed by the transcriber
-(`korjavin/transcriber`, README "Input"); the bot speaks it as is.
+(`korjavin/transcriber`, README "Input"); every orchestrator speaks it as is.
 
 On `recording.finished`, after its own policy (shorter than `MIN_RECORDING_S`
-→ a "too short" note, nothing sent), the bot sends `POST <WEBHOOK_URL>`:
+→ a "too short" note, nothing sent), the orchestrator sends
+`POST <WEBHOOK_URL>`:
 
 ```text
 x-jitsi-capture-event: recording.finished
@@ -230,6 +240,7 @@ x-jitsi-capture-signature: sha256=<hex HMAC-SHA256(raw body, WEBHOOK_SECRET)>
 {
   "event": "recording.finished",
   "id": "123456789",
+  "title": "Weekly sync",
   "message_id": 123456789,
   "stream": "some-stream",
   "topic": "some topic",
@@ -251,7 +262,11 @@ Mapping from the event: `audio_path` ← the `audio` artifact; `tracks` ←
 `track` artifacts (`id` ← `participant_id`); `speaker_hints_path` ← the
 `captions` artifact; `jitsi_url` ← `url` (any platform — the field name is the
 transcriber's); `source` is `"meet"` for Meet and omitted for Jitsi;
-`dm_user_id` only for a DM-started job (then `stream`/`topic` are empty);
+`title` is the Outline document title (the calendar event's summary; the
+Zulip bot omits it and the transcriber falls back to `topic`); `message_id` /
+`stream` / `topic` / `dm_user_id` are Zulip-only and omitted by other
+orchestrators; `dm_user_id` only for a DM-started job (then `stream`/`topic`
+are empty);
 `tracks` / `speaker_hints_path` only when present. Delivery retries like §3.5;
 the transcriber is idempotent on `id`.
 
@@ -264,7 +279,8 @@ x-jitsi-capture-signature: sha256=<hex HMAC-SHA256(raw body, WEBHOOK_SECRET)>
 {"id": "123456789", "content": "Transcript ready: <link>"}
 ```
 
-`content` is posted verbatim into the job's stream/topic or DM. Responses:
+The Zulip bot posts `content` verbatim into the job's stream/topic or DM; the
+calendar bot e-mails it to the person who connected the calendar. Responses:
 `200` · `400` missing fields · `401` bad signature · `404` unknown job · `502`
 Zulip refused the message.
 
@@ -279,7 +295,8 @@ One shared Docker named volume holds every recording. Its name comes from
 * meet-recorder writes under `DATA_DIR=/data/meet`;
 * the transcriber reads the paths from the webhook as they are.
 
-The bot does not mount it: it keeps only its own job state, in its own volume.
+Orchestrators do not mount it: each keeps only its own job state, in its own
+volume.
 
 Recordings are kept: recorders delete nothing. Later: move audio to
 S3-compatible storage and pass object URLs instead of paths; the contract then
@@ -291,4 +308,7 @@ changes only in `artifacts[].path` → `artifacts[].url`.
   needs it.
 * Concurrency limits per recorder — add when RAM becomes the bottleneck
   (~400–800 MB per Chromium).
-* Other front-ends (Telegram, calendar).
+* Other front-ends (Telegram).
+* One meeting requested through two orchestrators gets two NoteTakers: they
+  share no state. Later a recorder could refuse a second job for a URL it is
+  already recording.
