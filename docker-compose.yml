@@ -4,6 +4,11 @@ services:
     # commit SHA on the `deploy` branch, which is the branch Portainer watches.
     image: ghcr.io/korjavin/jitsi-recorder:latest
     container_name: jitsi-recorder
+    init: true
+    deploy:
+      resources:
+        limits:
+          memory: 1500M
     # Every variable config.js reads, passed through by name: Compose takes the
     # values from .env next to this file, or from the stack environment when
     # Portainer deploys this repo as a git stack. An unset variable is not
