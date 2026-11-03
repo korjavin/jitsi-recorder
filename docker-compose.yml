@@ -2,7 +2,7 @@ services:
   jitsi-recorder:
     # Placeholder tag. .github/workflows/deploy.yml rewrites this line with the
     # commit SHA on the `deploy` branch, which is the branch Portainer watches.
-    image: ghcr.io/korjavin/jitsi-recorder:latest
+    image: ghcr.io/korjavin/jitsi-recorder:f43828a11a12d0284ecb2c5432ce05ea52b5fdcf
     container_name: jitsi-recorder
     init: true
     deploy:
